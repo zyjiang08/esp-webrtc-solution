@@ -9,6 +9,7 @@
 
 #include <esp_log.h>
 #include "esp_console.h"
+#include "esp_capture.h"
 #include "media_lib_adapter.h"
 #include "media_lib_os.h"
 #include "common.h"
@@ -21,6 +22,11 @@ static int start_chat(int argc, char **argv)
         start_webrtc(url);
     }
     return 0;
+}
+
+static int capture_to_player_cli(int argc, char **argv)
+{
+    return test_capture_to_player();
 }
 
 #define RUN_ASYNC(name, body)           \
@@ -104,6 +110,11 @@ static int init_console()
             .help = "wifi ssid psw\r\n",
             .func = wifi_cli,
         },
+        {
+            .command = "rec2play",
+            .help = "Play capture content\n",
+            .func = capture_to_player_cli,
+        },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
@@ -114,11 +125,33 @@ static int init_console()
 
 static void thread_scheduler(const char *thread_name, media_lib_thread_cfg_t *thread_cfg)
 {
-    if (strcmp(thread_name, "pc_task") == 0) {
+    if (strcmp(thread_name, "pc_task") == 0 ||
+        strcmp(thread_name, "pc_offer") == 0 ||
+        strcmp(thread_name, "pc_remote") == 0) {
         thread_cfg->stack_size = 25 * 1024;
         thread_cfg->priority = 18;
         thread_cfg->core_id = 1;
+    } else if (strcmp(thread_name, "pc_send") == 0) {
+        thread_cfg->stack_size = 8 * 1024;
+        thread_cfg->priority = 18;
+        thread_cfg->core_id = 1;
+    } else if (strcmp(thread_name, "AUD_SRC") == 0) {
+        thread_cfg->priority = 15;
     }
+}
+
+static void capture_scheduler(const char *name, esp_capture_thread_schedule_cfg_t *schedule_cfg)
+{
+    media_lib_thread_cfg_t cfg = {
+        .stack_size = schedule_cfg->stack_size,
+        .priority = schedule_cfg->priority,
+        .core_id = schedule_cfg->core_id,
+    };
+    schedule_cfg->stack_in_ext = true;
+    thread_scheduler(name, &cfg);
+    schedule_cfg->stack_size = cfg.stack_size;
+    schedule_cfg->priority = cfg.priority;
+    schedule_cfg->core_id = cfg.core_id;
 }
 
 static int network_event_handler(bool connected)
@@ -133,7 +166,10 @@ void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
     media_lib_add_default_adapter();
+    esp_capture_set_thread_scheduler(capture_scheduler);
     media_lib_thread_set_schedule_cb(thread_scheduler);
+    init_board();
+    media_sys_buildup();
     init_console();
     network_init(WIFI_SSID, WIFI_PASSWORD, network_event_handler);
     while (1) {

@@ -1,0 +1,33 @@
+idf_component_register(
+    SRCS
+        "src/address.c"
+        "src/agent.c"
+        "src/base64.c"
+        "src/dtls_srtp.c"
+        "src/ice.c"
+        "src/mdns.c"
+        "src/peer.c"
+        "src/peer_connection.c"
+        "src/ports.c"
+        "src/rtcp.c"
+        "src/rtp.c"
+        "src/sctp.c"
+        "src/sdp.c"
+        "src/socket.c"
+        "src/stun.c"
+        "src/utils.c"
+    INCLUDE_DIRS
+        "src"
+    REQUIRES
+        mbedtls
+        esp_netif
+        lwip
+        espressif__esp_libsrtp
+)
+
+target_compile_definitions(${COMPONENT_LIB} PUBLIC
+    CONFIG_USE_LWIP=1
+    CONFIG_USE_USRSCTP=0
+    CONFIG_IPV6=0
+    CONFIG_IFACE_PREFIX=""
+)

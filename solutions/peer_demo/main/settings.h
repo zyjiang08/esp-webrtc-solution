@@ -9,19 +9,35 @@
 
 #pragma once
 
+#include "sdkconfig.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
+ * @brief  Set used board name, see `codec_board` README.md for more details
+ */
+#if CONFIG_IDF_TARGET_ESP32P4
+#define TEST_BOARD_NAME "ESP32_P4_DEV_V14"
+#else
+#define TEST_BOARD_NAME "S3_Korvo_V2"
+#endif
+
+/**
  * @brief  Set for wifi ssid
  */
-#define WIFI_SSID     "XXXX"
+#define WIFI_SSID     "TP-LINK_harry"
 
 /**
  * @brief  Set for wifi password
  */
-#define WIFI_PASSWORD "XXXX"
+#define WIFI_PASSWORD "edc123456"
+
+/**
+ * @brief  Set default playback volume
+ */
+#define DEFAULT_PLAYBACK_VOL (85)
 
 #ifdef __cplusplus
 }

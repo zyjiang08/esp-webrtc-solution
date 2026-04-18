@@ -14,8 +14,14 @@ extern "C" {
 #endif
 
 #include "settings.h"
+#include "media_sys.h"
 #include "network.h"
 #include "sys_state.h"
+
+/**
+ * @brief  Initialize board peripherals
+ */
+void init_board(void);
 
 /**
  * @brief  Start WebRTC
