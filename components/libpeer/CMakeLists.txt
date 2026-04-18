@@ -17,6 +17,7 @@ idf_component_register(
         "src/stun.c"
         "src/utils.c"
     INCLUDE_DIRS
+        "include"
         "src"
     REQUIRES
         mbedtls
