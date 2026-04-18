@@ -23,6 +23,26 @@
 
 ---
 
+## 环境基线
+
+本次改造、编译与烧录验证基于如下环境：
+
+- 主机系统：`macOS 14.6.1 (23G93)`
+- `ESP-IDF`：`v5.4-dirty`，提交 `67c1de1eeb`
+- `idf.py` 使用 Python：`~/.espressif/python_env/idf5.4_py3.13_env/bin/python` `3.13.2`
+- 系统 Python：`3.14.3`（未直接用于构建）
+- `ESP-ADF`：`v2.7-99-geca11f20`，提交 `eca11f20`
+- `xtensa-esp-elf-gcc`：`14.2.0`
+- `esptool.py`：`4.11.0`
+
+补充说明：
+
+- `peer_demo` 当前实际构建方式为 `ESP-IDF + 本仓组件 + dependencies.lock`
+- `dependencies.lock` 锁定 `idf` 为 `5.4.0`
+- 因此当前建议保持 `ESP-IDF v5.4` 基线，不建议在问题定位阶段先切到 `v5.5.1`
+
+---
+
 ## 主要改动
 
 ### 1. 引入源码版 `libpeer`
