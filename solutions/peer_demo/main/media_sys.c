@@ -51,10 +51,14 @@ static player_system_t  player_sys;
 
 static int build_capture_system(void)
 {
-    esp_capture_audio_dev_src_cfg_t codec_cfg = {
+    esp_capture_audio_aec_src_cfg_t codec_cfg = {
         .record_handle = get_record_handle(),
+#if CONFIG_IDF_TARGET_ESP32S3
+        .channel = 4,
+        .channel_mask = 1 | 2,
+#endif
     };
-    capture_sys.aud_src = esp_capture_new_audio_dev_src(&codec_cfg);
+    capture_sys.aud_src = esp_capture_new_audio_aec_src(&codec_cfg);
     RET_ON_NULL(capture_sys.aud_src, -1);
 
     esp_capture_cfg_t cfg = {
@@ -80,8 +84,8 @@ static int build_player_system(void)
 
     av_render_cfg_t render_cfg = {
         .audio_render = player_sys.audio_render,
-        .audio_raw_fifo_size = 4096,
-        .audio_render_fifo_size = 6 * 1024,
+        .audio_raw_fifo_size = 8 * 4096,
+        .audio_render_fifo_size = 100 * 1024,
         .allow_drop_data = false,
     };
     player_sys.player = av_render_open(&render_cfg);
@@ -89,6 +93,17 @@ static int build_player_system(void)
         ESP_LOGE(TAG, "Fail to create player");
         return -1;
     }
+
+    av_render_audio_frame_info_t aud_info = {
+        .sample_rate = AUDIO_SAMPLE_RATE,
+        .channel = 2,
+        .bits_per_sample = AUDIO_BITS_PER_SAMPLE,
+    };
+    av_render_set_fixed_frame_info(player_sys.player, &aud_info);
+
+    uint32_t audio_threshold = 0;
+    audio_threshold *= aud_info.sample_rate * aud_info.channel * (aud_info.bits_per_sample >> 3) / 1000;
+    av_render_set_audio_threshold(player_sys.player, audio_threshold);
     return 0;
 }
 
