@@ -25,6 +25,7 @@ struct PeerConnection {
   Agent agent;
   DtlsSrtp dtls_srtp;
   Sctp sctp;
+  int remote_description_set;
 
   char sdp[CONFIG_SDP_BUFFER_SIZE];
 
@@ -45,6 +46,8 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+  uint32_t incoming_audio_rtp_packets;
+  uint32_t incoming_video_rtp_packets;
 };
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
@@ -93,7 +96,7 @@ static void peer_connection_incoming_rtcp(PeerConnection* pc, uint8_t* buf, size
 
     switch (rtcp_header->type) {
       case RTCP_RR:
-        LOGD("RTCP_PR");
+        LOGI("Got RTCP RR rc=%d", rtcp_header_get_rc(rtcp_header));
         if (rtcp_header_get_rc(rtcp_header) > 0) {
 // TODO: REMB, GCC ...etc
 #if 0
@@ -294,6 +297,14 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
+      if (pc->remote_description_set == 0 ||
+          pc->agent.remote_ufrag[0] == 0 ||
+          pc->agent.remote_upwd[0] == 0) {
+        break;
+      }
+      if (pc->agent.candidate_pairs_num == 0) {
+        break;
+      }
       if (agent_select_candidate_pair(&pc->agent) < 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       } else if (agent_connectivity_check(&pc->agent) == 0) {
@@ -302,6 +313,13 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CONNECTED:
+
+      if (pc->remote_description_set == 0 ||
+          pc->agent.remote_ufrag[0] == 0 ||
+          pc->agent.remote_upwd[0] == 0 ||
+          pc->dtls_srtp.remote_fingerprint[0] == 0) {
+        break;
+      }
 
       if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
         LOGD("DTLS-SRTP handshake done");
@@ -338,10 +356,43 @@ int peer_connection_loop(PeerConnection* pc) {
           dtls_srtp_decrypt_rtp_packet(&pc->dtls_srtp, pc->agent_buf, &pc->agent_ret);
 
           ssrc = rtp_get_ssrc(pc->agent_buf);
-          if (ssrc == pc->remote_assrc) {
+          uint8_t payload_type = rtp_header_get_payload_type((RtpHeader*)pc->agent_buf);
+          int audio_match = (ssrc == pc->remote_assrc);
+          int video_match = (ssrc == pc->remote_vssrc);
+
+          if (!audio_match && pc->config.audio_codec != CODEC_NONE) {
+            if ((pc->remote_assrc == 0 && payload_type == pc->artp_decoder.type) ||
+                (pc->config.video_codec == CODEC_NONE && payload_type == pc->artp_decoder.type)) {
+              audio_match = 1;
+            }
+          }
+
+          if (!video_match && pc->config.video_codec != CODEC_NONE) {
+            if ((pc->remote_vssrc == 0 && payload_type == pc->vrtp_decoder.type) ||
+                (pc->config.audio_codec == CODEC_NONE && payload_type == pc->vrtp_decoder.type)) {
+              video_match = 1;
+            }
+          }
+
+          if (audio_match) {
+            pc->incoming_audio_rtp_packets++;
+            if ((pc->incoming_audio_rtp_packets % 50) == 1) {
+              LOGI("Incoming audio RTP ssrc=%" PRIu32 " pt=%u bytes=%d packets=%" PRIu32,
+                   ssrc,
+                   payload_type,
+                   pc->agent_ret,
+                   pc->incoming_audio_rtp_packets);
+            }
             rtp_decoder_decode(&pc->artp_decoder, pc->agent_buf, pc->agent_ret);
-          } else if (ssrc == pc->remote_vssrc) {
+          } else if (video_match) {
+            pc->incoming_video_rtp_packets++;
             rtp_decoder_decode(&pc->vrtp_decoder, pc->agent_buf, pc->agent_ret);
+          } else {
+            LOGW("Drop RTP ssrc=%" PRIu32 " pt=%u audio_ssrc=%" PRIu32 " video_ssrc=%" PRIu32,
+                 ssrc,
+                 payload_type,
+                 pc->remote_assrc,
+                 pc->remote_vssrc);
           }
 
         } else {
@@ -370,28 +421,44 @@ int peer_connection_loop(PeerConnection* pc) {
 
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
   char* start = (char*)sdp;
-  char* line = NULL;
   char buf[256];
   char* val_start = NULL;
   uint32_t* ssrc = NULL;
-  DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
   int is_update = 0;
   Agent* agent = &pc->agent;
+  char parsed_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH] = {0};
 
-  while ((line = strstr(start, "\r\n"))) {
-    line = strstr(start, "\r\n");
-    strncpy(buf, start, line - start);
-    buf[line - start] = '\0';
+  while (start && *start) {
+    size_t line_len = strcspn(start, "\r\n");
+    char* line = start + line_len;
 
-    if (strstr(buf, "a=setup:passive")) {
-      role = DTLS_SRTP_ROLE_CLIENT;
+    if (line_len == 0) {
+      while (*line == '\r' || *line == '\n') {
+        line++;
+      }
+      start = line;
+      continue;
     }
 
-    if (strstr(buf, "a=fingerprint")) {
-      strncpy(pc->dtls_srtp.remote_fingerprint, buf + 22, DTLS_SRTP_FINGERPRINT_LENGTH);
+    if (line_len >= sizeof(buf)) {
+      line_len = sizeof(buf) - 1;
+    }
+    memcpy(buf, start, line_len);
+    buf[line_len] = '\0';
+
+    if (strncmp(buf, "a=fingerprint:", strlen("a=fingerprint:")) == 0) {
+      char* fingerprint = strchr(buf, ' ');
+      if (fingerprint && *(fingerprint + 1) != '\0') {
+        size_t fingerprint_len = strlen(fingerprint + 1);
+        if (fingerprint_len >= sizeof(parsed_fingerprint)) {
+          fingerprint_len = sizeof(parsed_fingerprint) - 1;
+        }
+        memcpy(parsed_fingerprint, fingerprint + 1, fingerprint_len);
+        parsed_fingerprint[fingerprint_len] = '\0';
+      }
     }
 
-    if (strstr(buf, "a=ice-ufrag") &&
+    if (strncmp(buf, "a=ice-ufrag:", strlen("a=ice-ufrag:")) == 0 &&
         strlen(agent->remote_ufrag) != 0 &&
         (strncmp(buf + strlen("a=ice-ufrag:"), agent->remote_ufrag, strlen(agent->remote_ufrag)) == 0)) {
       is_update = 1;
@@ -408,14 +475,34 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
       LOGD("SSRC: %" PRIu32, *ssrc);
     }
 
-    start = line + 2;
+    while (*line == '\r' || *line == '\n') {
+      line++;
+    }
+    start = line;
   }
+
+  LOGI("Set remote description type=%s remote_ufrag=%s parsed_fingerprint=%s",
+       type == SDP_TYPE_ANSWER ? "answer" : "offer",
+       agent->remote_ufrag[0] ? agent->remote_ufrag : "<pending>",
+       parsed_fingerprint[0] ? parsed_fingerprint : "<pending>");
 
   if (is_update) {
     return;
   }
 
+  memset(pc->dtls_srtp.remote_fingerprint, 0, sizeof(pc->dtls_srtp.remote_fingerprint));
+  if (parsed_fingerprint[0]) {
+    memcpy(pc->dtls_srtp.remote_fingerprint, parsed_fingerprint, strlen(parsed_fingerprint));
+  }
+
   agent_set_remote_description(&pc->agent, (char*)sdp);
+  pc->remote_description_set = 1;
+  LOGI("Remote description parsed ufrag=%s fingerprint=%s",
+       agent->remote_ufrag,
+       pc->dtls_srtp.remote_fingerprint[0] ? pc->dtls_srtp.remote_fingerprint : "<missing>");
+  LOGI("Remote media ssrc audio=%" PRIu32 " video=%" PRIu32,
+       pc->remote_assrc,
+       pc->remote_vssrc);
   if (type == SDP_TYPE_ANSWER) {
     agent_update_candidate_pairs(&pc->agent);
     STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
@@ -579,18 +666,23 @@ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid) {
 int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
   Agent* agent = &pc->agent;
   if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], candidate, candidate + strlen(candidate)) != 0) {
+    LOGW("Ignore invalid remote candidate: %s", candidate);
     return -1;
   }
   for (int i = 0; i < agent->remote_candidates_count; i++) {
     if (strcmp(agent->remote_candidates[i].foundation,
                agent->remote_candidates[agent->remote_candidates_count].foundation) == 0) {
+      LOGD("Ignore duplicated remote candidate: %s", candidate);
       return 0;
     }
   }
-  LOGD("Add candidate: %s", candidate);
+  LOGI("Add remote candidate: %s", candidate);
   agent->remote_candidates_count++;
   agent_update_candidate_pairs(&pc->agent);
-  if (pc->state == PEER_CONNECTION_FAILED || pc->state == PEER_CONNECTION_NEW) {
+  if ((pc->state == PEER_CONNECTION_FAILED || pc->state == PEER_CONNECTION_NEW) &&
+      pc->remote_description_set &&
+      agent->remote_ufrag[0] != 0 &&
+      agent->remote_upwd[0] != 0) {
     STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
   }
   return 0;

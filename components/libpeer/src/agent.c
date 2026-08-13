@@ -13,9 +13,37 @@
 #include "utils.h"
 
 #define AGENT_POLL_TIMEOUT 1
-#define AGENT_CONNCHECK_MAX 1000
-#define AGENT_CONNCHECK_PERIOD 100
+#define AGENT_CONNCHECK_MAX 100
+#define AGENT_CONNCHECK_PERIOD 10
 #define AGENT_STUN_RECV_MAXTIMES 1000
+
+static int agent_candidate_pair_exists(Agent* agent, IceCandidate* local, IceCandidate* remote) {
+  for (int i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].local == local && agent->candidate_pairs[i].remote == remote) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int agent_ipv4_same_subnet24(const Address* local, const Address* remote) {
+  if (local->family != AF_INET || remote->family != AF_INET) {
+    return 0;
+  }
+  uint32_t local_ip = ntohl(local->sin.sin_addr.s_addr);
+  uint32_t remote_ip = ntohl(remote->sin.sin_addr.s_addr);
+  return (local_ip & 0xFFFFFF00U) == (remote_ip & 0xFFFFFF00U);
+}
+
+static uint64_t agent_candidate_pair_priority(IceCandidate* local, IceCandidate* remote) {
+  uint64_t priority = (uint64_t)local->priority + (uint64_t)remote->priority;
+  if (local->type == ICE_CANDIDATE_TYPE_HOST &&
+      remote->type == ICE_CANDIDATE_TYPE_HOST &&
+      agent_ipv4_same_subnet24(&local->addr, &remote->addr)) {
+    priority += (1ULL << 62);
+  }
+  return priority;
+}
 
 void agent_clear_candidates(Agent* agent) {
   agent->local_candidates_count = 0;
@@ -405,14 +433,37 @@ void agent_set_remote_description(Agent* agent, char* description) {
   LOGD("Set remote description:\n%s", description);
 
   char* line_start = description;
-  char* line_end = NULL;
 
-  while ((line_end = strstr(line_start, "\r\n")) != NULL) {
+  memset(agent->remote_ufrag, 0, sizeof(agent->remote_ufrag));
+  memset(agent->remote_upwd, 0, sizeof(agent->remote_upwd));
+
+  while (line_start && *line_start) {
+    size_t line_len = strcspn(line_start, "\r\n");
+    char* line_end = line_start + line_len;
+
+    if (line_len == 0) {
+      while (*line_end == '\r' || *line_end == '\n') {
+        line_end++;
+      }
+      line_start = line_end;
+      continue;
+    }
+
     if (strncmp(line_start, "a=ice-ufrag:", strlen("a=ice-ufrag:")) == 0) {
-      strncpy(agent->remote_ufrag, line_start + strlen("a=ice-ufrag:"), line_end - line_start - strlen("a=ice-ufrag:"));
+      size_t value_len = line_len - strlen("a=ice-ufrag:");
+      if (value_len >= sizeof(agent->remote_ufrag)) {
+        value_len = sizeof(agent->remote_ufrag) - 1;
+      }
+      memcpy(agent->remote_ufrag, line_start + strlen("a=ice-ufrag:"), value_len);
+      agent->remote_ufrag[value_len] = '\0';
 
     } else if (strncmp(line_start, "a=ice-pwd:", strlen("a=ice-pwd:")) == 0) {
-      strncpy(agent->remote_upwd, line_start + strlen("a=ice-pwd:"), line_end - line_start - strlen("a=ice-pwd:"));
+      size_t value_len = line_len - strlen("a=ice-pwd:");
+      if (value_len >= sizeof(agent->remote_upwd)) {
+        value_len = sizeof(agent->remote_upwd) - 1;
+      }
+      memcpy(agent->remote_upwd, line_start + strlen("a=ice-pwd:"), value_len);
+      agent->remote_upwd[value_len] = '\0';
 
     } else if (strncmp(line_start, "a=candidate:", strlen("a=candidate:")) == 0) {
       if (ice_candidate_from_description(&agent->remote_candidates[agent->remote_candidates_count], line_start, line_end) == 0) {
@@ -427,7 +478,10 @@ void agent_set_remote_description(Agent* agent, char* description) {
       }
     }
 
-    line_start = line_end + 2;
+    while (*line_end == '\r' || *line_end == '\n') {
+      line_end++;
+    }
+    line_start = line_end;
   }
 
   LOGD("remote ufrag: %s", agent->remote_ufrag);
@@ -440,10 +494,19 @@ void agent_update_candidate_pairs(Agent* agent) {
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {
       if (agent->local_candidates[i].addr.family == agent->remote_candidates[j].addr.family) {
+        if (agent_candidate_pair_exists(agent, &agent->local_candidates[i], &agent->remote_candidates[j])) {
+          continue;
+        }
+        if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
+          LOGW("candidate pair list full, ignore extra pair");
+          return;
+        }
         agent->candidate_pairs[agent->candidate_pairs_num].local = &agent->local_candidates[i];
         agent->candidate_pairs[agent->candidate_pairs_num].remote = &agent->remote_candidates[j];
-        agent->candidate_pairs[agent->candidate_pairs_num].priority = agent->local_candidates[i].priority + agent->remote_candidates[j].priority;
+        agent->candidate_pairs[agent->candidate_pairs_num].priority =
+            agent_candidate_pair_priority(&agent->local_candidates[i], &agent->remote_candidates[j]);
         agent->candidate_pairs[agent->candidate_pairs_num].state = ICE_CANDIDATE_STATE_FROZEN;
+        agent->candidate_pairs[agent->candidate_pairs_num].conncheck = 0;
         agent->candidate_pairs_num++;
       }
     }
@@ -481,26 +544,48 @@ int agent_connectivity_check(Agent* agent) {
 }
 
 int agent_select_candidate_pair(Agent* agent) {
-  int i;
-  for (i = 0; i < agent->candidate_pairs_num; i++) {
-    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
-      // nominate this pair
-      agent->nominated_pair = &agent->candidate_pairs[i];
-      agent->candidate_pairs[i].conncheck = 0;
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
-      return 0;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
-      agent->candidate_pairs[i].conncheck++;
-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
-        return 0;
-      }
-      agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
-      agent->selected_pair = &agent->candidate_pairs[i];
+  IceCandidatePair* best_frozen = NULL;
+  IceCandidatePair* current = NULL;
+
+  for (int i = 0; i < agent->candidate_pairs_num; i++) {
+    IceCandidatePair* pair = &agent->candidate_pairs[i];
+    if (pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+      agent->selected_pair = pair;
       return 0;
     }
+    if (pair->state == ICE_CANDIDATE_STATE_INPROGRESS && current == NULL) {
+      current = pair;
+      continue;
+    }
+    if (pair->state == ICE_CANDIDATE_STATE_FROZEN) {
+      if (best_frozen == NULL || pair->priority > best_frozen->priority) {
+        best_frozen = pair;
+      }
+    }
   }
+
+  if (current && best_frozen && best_frozen->priority > current->priority) {
+    current->state = ICE_CANDIDATE_STATE_FROZEN;
+    current = NULL;
+  }
+
+  if (current) {
+    current->conncheck++;
+    if (current->conncheck < AGENT_CONNCHECK_MAX) {
+      agent->nominated_pair = current;
+      return 0;
+    }
+    current->state = ICE_CANDIDATE_STATE_FAILED;
+    current = NULL;
+  }
+
+  if (best_frozen) {
+    agent->nominated_pair = best_frozen;
+    best_frozen->conncheck = 0;
+    best_frozen->state = ICE_CANDIDATE_STATE_INPROGRESS;
+    return 0;
+  }
+
   // all candidate pairs are failed
   return -1;
 }

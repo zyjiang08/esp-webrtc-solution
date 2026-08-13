@@ -49,11 +49,21 @@ static bool media_send_running = false;
 static bool media_send_task_running = false;
 static bool player_stream_ready = false;
 static uint32_t recv_audio_pts = 0;
+static uint32_t recv_audio_packets = 0;
+static uint32_t recv_audio_bytes = 0;
+static uint32_t recv_audio_render_fail = 0;
+static uint16_t recv_audio_peak = 0;
+static uint64_t recv_audio_abs_sum = 0;
+static uint32_t recv_audio_sample_count = 0;
+static int64_t recv_audio_log_time = 0;
 static uint8_t send_audio_buf[AUDIO_SEND_BUFFER_BYTES];
 static size_t send_audio_buf_len = 0;
 static uint32_t sent_audio_packets = 0;
 static uint32_t sent_audio_active_packets = 0;
 static uint32_t sent_audio_silence_packets = 0;
+static uint16_t sent_audio_peak = 0;
+static uint64_t sent_audio_abs_sum = 0;
+static uint32_t sent_audio_sample_count = 0;
 static int64_t sent_audio_log_time = 0;
 static esp_capture_handle_t capture_handle = NULL;
 static esp_capture_sink_handle_t capture_path = NULL;
@@ -104,6 +114,51 @@ static bool g711a_packet_looks_silence(const uint8_t *data, size_t size)
         }
     }
     return silence_like * 10 >= size * 9;
+}
+
+static int16_t g711a_decode_sample(uint8_t alaw)
+{
+    alaw ^= 0x55;
+    int value = (alaw & 0x0F) << 4;
+    int segment = (alaw & 0x70) >> 4;
+    switch (segment) {
+        case 0:
+            value += 8;
+            break;
+        case 1:
+            value += 0x108;
+            break;
+        default:
+            value += 0x108;
+            value <<= (segment - 1);
+            break;
+    }
+    return (alaw & 0x80) ? value : -value;
+}
+
+static void g711a_accumulate_level(const uint8_t *data, size_t size,
+                                   uint64_t *abs_sum, uint32_t *sample_count, uint16_t *peak)
+{
+    if (data == NULL || size == 0 || abs_sum == NULL || sample_count == NULL || peak == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < size; i++) {
+        int32_t sample = g711a_decode_sample(data[i]);
+        uint32_t abs_sample = (sample < 0) ? (uint32_t)(-sample) : (uint32_t)sample;
+        *abs_sum += abs_sample;
+        (*sample_count)++;
+        if (abs_sample > *peak) {
+            *peak = abs_sample;
+        }
+    }
+}
+
+static uint32_t g711_level_avg_abs(uint64_t abs_sum, uint32_t sample_count)
+{
+    if (sample_count == 0) {
+        return 0;
+    }
+    return (uint32_t)(abs_sum / sample_count);
 }
 
 static data_channel_chat_content_t chat_content[] = {
@@ -190,6 +245,10 @@ static void media_send_task(void *arg)
                             ESP_LOGW(TAG, "Send audio frame failed: %d", ret);
                             break;
                         }
+                        g711a_accumulate_level(send_audio_buf, AUDIO_SEND_FRAME_BYTES,
+                                               &sent_audio_abs_sum,
+                                               &sent_audio_sample_count,
+                                               &sent_audio_peak);
                         sent_audio_packets++;
                         if (looks_silence) {
                             sent_audio_silence_packets++;
@@ -208,14 +267,20 @@ static void media_send_task(void *arg)
             }
             int64_t now = esp_timer_get_time();
             if (now - sent_audio_log_time >= 1000000) {
-                ESP_LOGI(TAG, "Sent audio packets=%u active=%u silence_like=%u pending=%u",
+                ESP_LOGI(TAG,
+                         "Sent audio packets=%u active=%u silence_like=%u pending=%u avg_abs=%u peak=%u",
                          (unsigned)sent_audio_packets,
                          (unsigned)sent_audio_active_packets,
                          (unsigned)sent_audio_silence_packets,
-                         (unsigned)send_audio_buf_len);
+                         (unsigned)send_audio_buf_len,
+                         (unsigned)g711_level_avg_abs(sent_audio_abs_sum, sent_audio_sample_count),
+                         (unsigned)sent_audio_peak);
                 sent_audio_packets = 0;
                 sent_audio_active_packets = 0;
                 sent_audio_silence_packets = 0;
+                sent_audio_peak = 0;
+                sent_audio_abs_sum = 0;
+                sent_audio_sample_count = 0;
                 sent_audio_log_time = now;
             }
         }
@@ -258,6 +323,16 @@ static int start_media_stream(void)
     }
     media_stream_started = true;
     recv_audio_pts = 0;
+    recv_audio_packets = 0;
+    recv_audio_bytes = 0;
+    recv_audio_render_fail = 0;
+    recv_audio_peak = 0;
+    recv_audio_abs_sum = 0;
+    recv_audio_sample_count = 0;
+    recv_audio_log_time = esp_timer_get_time();
+    sent_audio_peak = 0;
+    sent_audio_abs_sum = 0;
+    sent_audio_sample_count = 0;
     ESP_LOGI(TAG, "Real audio stream started");
     return 0;
 }
@@ -283,10 +358,19 @@ static void stop_media_stream(void)
     media_stream_started = false;
     player_stream_ready = false;
     recv_audio_pts = 0;
+    recv_audio_packets = 0;
+    recv_audio_bytes = 0;
+    recv_audio_render_fail = 0;
+    recv_audio_peak = 0;
+    recv_audio_abs_sum = 0;
+    recv_audio_sample_count = 0;
     send_audio_buf_len = 0;
     sent_audio_packets = 0;
     sent_audio_active_packets = 0;
     sent_audio_silence_packets = 0;
+    sent_audio_peak = 0;
+    sent_audio_abs_sum = 0;
+    sent_audio_sample_count = 0;
 }
 
 static void send_cb(void *ctx)
@@ -367,13 +451,47 @@ static void peer_audio_data_handler(uint8_t *data, size_t size, void *ctx)
     if (player_handle == NULL || player_stream_ready == false || size == 0) {
         return;
     }
+    recv_audio_packets++;
+    recv_audio_bytes += size;
+    g711a_accumulate_level(data, size, &recv_audio_abs_sum, &recv_audio_sample_count, &recv_audio_peak);
     av_render_audio_data_t audio_data = {
         .pts = recv_audio_pts,
         .data = data,
         .size = size,
     };
-    av_render_add_audio_data(player_handle, &audio_data);
+    int ret = av_render_add_audio_data(player_handle, &audio_data);
+    if (ret != 0) {
+        recv_audio_render_fail++;
+        if (recv_audio_render_fail <= 5 || (recv_audio_render_fail % 50) == 0) {
+            ESP_LOGW(TAG, "Render remote audio failed ret=%d fails=%u size=%u pts=%u",
+                     ret,
+                     (unsigned)recv_audio_render_fail,
+                     (unsigned)size,
+                     (unsigned)recv_audio_pts);
+        }
+    }
     recv_audio_pts += (uint32_t)((size * 1000ULL) / AUDIO_SAMPLE_RATE);
+    int64_t now = esp_timer_get_time();
+    if (recv_audio_log_time == 0) {
+        recv_audio_log_time = now;
+    }
+    if (now - recv_audio_log_time >= 1000000) {
+        ESP_LOGI(TAG,
+                 "Recv audio packets=%u bytes=%u avg_abs=%u peak=%u render_fail=%u last=%u",
+                 (unsigned)recv_audio_packets,
+                 (unsigned)recv_audio_bytes,
+                 (unsigned)g711_level_avg_abs(recv_audio_abs_sum, recv_audio_sample_count),
+                 (unsigned)recv_audio_peak,
+                 (unsigned)recv_audio_render_fail,
+                 (unsigned)size);
+        recv_audio_packets = 0;
+        recv_audio_bytes = 0;
+        recv_audio_render_fail = 0;
+        recv_audio_peak = 0;
+        recv_audio_abs_sum = 0;
+        recv_audio_sample_count = 0;
+        recv_audio_log_time = now;
+    }
 }
 
 static void peer_data_open_handler(void *ctx)

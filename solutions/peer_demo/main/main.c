@@ -10,6 +10,8 @@
 #include <esp_log.h>
 #include "esp_console.h"
 #include "esp_capture.h"
+#include "esp_codec_dev.h"
+#include "codec_init.h"
 #include "media_lib_adapter.h"
 #include "media_lib_os.h"
 #include "common.h"
@@ -65,6 +67,29 @@ static int wifi_cli(int argc, char **argv)
     return network_connect_wifi(ssid, password);
 }
 
+static int volume_cli(int argc, char **argv)
+{
+    if (argc < 2) {
+        ESP_LOGI("CLI", "Usage: vol <0-100>");
+        return -1;
+    }
+    int volume = atoi(argv[1]);
+    if (volume < 0) {
+        volume = 0;
+    }
+    if (volume > 100) {
+        volume = 100;
+    }
+    esp_codec_dev_handle_t playback = get_playback_handle();
+    if (playback == NULL) {
+        ESP_LOGE("CLI", "Playback handle not ready");
+        return -1;
+    }
+    esp_codec_dev_set_out_vol(playback, (float)volume);
+    ESP_LOGI("CLI", "Speaker volume set to %d", volume);
+    return 0;
+}
+
 static int init_console()
 {
     esp_console_repl_t *repl = NULL;
@@ -114,6 +139,11 @@ static int init_console()
             .command = "rec2play",
             .help = "Play capture content\n",
             .func = capture_to_player_cli,
+        },
+        {
+            .command = "vol",
+            .help = "Set speaker volume 0-100\n",
+            .func = volume_cli,
         },
     };
     for (int i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

@@ -10,7 +10,7 @@ int rtcp_probe(uint8_t* packet, size_t size) {
     return -1;
 
   RtcpHeader* header = (RtcpHeader*)packet;
-  return (rtcp_header_get_version(header) == 2) && ((header->type >= 64) && (header->type < 96));
+  return (rtcp_header_get_version(header) == 2) && ((header->type >= 192) && (header->type <= 223));
 }
 
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc) {

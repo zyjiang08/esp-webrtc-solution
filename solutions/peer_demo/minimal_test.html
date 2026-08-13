@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Peer Demo Minimal Audio Test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; background: #111827; color: #e5e7eb; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    input, button { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid #374151; }
+    input { background: #0f172a; color: #e5e7eb; min-width: 220px; }
+    button { background: #1f2937; color: #e5e7eb; cursor: pointer; }
+    button:hover { background: #374151; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card { background: #0f172a; border: 1px solid #374151; border-radius: 12px; padding: 12px; }
+    .label { font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 320px; overflow: auto; }
+    audio { width: 100%; margin-top: 8px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <h1>Peer Demo Minimal Audio Test</h1>
+  <div class="row">
+    <input id="roomId" value="room3322" placeholder="Room ID">
+    <button id="joinBtn">Join Room</button>
+    <button id="forcePlayBtn">Force Audio Play</button>
+    <button id="statsBtn">Get Stats Now</button>
+    <button id="leaveBtn">Leave</button>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <div class="label">Remote Audio</div>
+      <audio id="remoteAudio" controls autoplay playsinline></audio>
+      <pre id="remoteState" class="mono"></pre>
+    </div>
+    <div class="card">
+      <div class="label">Local Audio</div>
+      <audio id="localAudio" controls autoplay playsinline muted></audio>
+      <pre id="localState" class="mono"></pre>
+    </div>
+    <div class="card full">
+      <div class="label">Stats</div>
+      <pre id="stats" class="mono"></pre>
+    </div>
+    <div class="card full">
+      <div class="label">Log</div>
+      <pre id="log" class="mono"></pre>
+    </div>
+  </div>
+
+  <script>
+    const PROXY_PATH = '/proxy?url=';
+    const APPRTC_BASE = 'https://webrtc.espressif.com';
+
+    const roomInput = document.getElementById('roomId');
+    const joinBtn = document.getElementById('joinBtn');
+    const leaveBtn = document.getElementById('leaveBtn');
+    const forcePlayBtn = document.getElementById('forcePlayBtn');
+    const statsBtn = document.getElementById('statsBtn');
+    const remoteAudio = document.getElementById('remoteAudio');
+    const localAudio = document.getElementById('localAudio');
+    const statsEl = document.getElementById('stats');
+    const logEl = document.getElementById('log');
+    const remoteStateEl = document.getElementById('remoteState');
+    const localStateEl = document.getElementById('localState');
+
+    let pc = null;
+    let localStream = null;
+    let remoteStream = null;
+    let joinInfo = null;
+    let audioContext = null;
+    let remoteSourceNode = null;
+    let remoteAnalyserNode = null;
+    let remoteGainNode = null;
+    let remoteLevelTimer = null;
+    let remoteRms = 0;
+    let statsTimer = null;
+    let queuedRemoteCandidates = [];
+
+    function log(...args) {
+      const line = args.map(v => typeof v === 'string' ? v : JSON.stringify(v)).join(' ');
+      console.log('[minimal-test]', ...args);
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setState() {
+      remoteStateEl.textContent = [
+        `paused=${remoteAudio.paused}`,
+        `muted=${remoteAudio.muted}`,
+        `volume=${remoteAudio.volume}`,
+        `readyState=${remoteAudio.readyState}`,
+        `currentTime=${remoteAudio.currentTime.toFixed(3)}`,
+        `srcObject=${!!remoteAudio.srcObject}`,
+        `tracks=${remoteStream ? remoteStream.getTracks().length : 0}`,
+        `remoteRms=${remoteRms.toFixed(4)}`,
+      ].join('\n');
+
+      localStateEl.textContent = [
+        `srcObject=${!!localAudio.srcObject}`,
+        `tracks=${localStream ? localStream.getTracks().length : 0}`,
+        `muted=${localAudio.muted}`,
+        `volume=${localAudio.volume}`,
+      ].join('\n');
+    }
+
+    function stopRemoteAudioGraph() {
+      if (remoteLevelTimer) {
+        clearInterval(remoteLevelTimer);
+        remoteLevelTimer = null;
+      }
+      try { remoteSourceNode && remoteSourceNode.disconnect(); } catch (_) {}
+      try { remoteAnalyserNode && remoteAnalyserNode.disconnect(); } catch (_) {}
+      try { remoteGainNode && remoteGainNode.disconnect(); } catch (_) {}
+      remoteSourceNode = null;
+      remoteAnalyserNode = null;
+      remoteGainNode = null;
+      remoteRms = 0;
+      setState();
+    }
+
+    async function attachRemoteAudioGraph(stream) {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioContext.state !== 'running') {
+        await audioContext.resume();
+      }
+      stopRemoteAudioGraph();
+      remoteSourceNode = audioContext.createMediaStreamSource(stream);
+      remoteAnalyserNode = audioContext.createAnalyser();
+      remoteAnalyserNode.fftSize = 1024;
+      remoteGainNode = audioContext.createGain();
+      remoteGainNode.gain.value = 1.0;
+      remoteSourceNode.connect(remoteAnalyserNode);
+      remoteAnalyserNode.connect(remoteGainNode);
+      remoteGainNode.connect(audioContext.destination);
+
+      const data = new Uint8Array(remoteAnalyserNode.fftSize);
+      remoteLevelTimer = setInterval(() => {
+        if (!remoteAnalyserNode) {
+          return;
+        }
+        remoteAnalyserNode.getByteTimeDomainData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) {
+          const value = (data[i] - 128) / 128;
+          sum += value * value;
+        }
+        remoteRms = Math.sqrt(sum / data.length);
+        setState();
+      }, 300);
+
+      log('remote audio graph attached');
+    }
+
+    async function proxyFetch(targetUrl, options = {}) {
+      const url = PROXY_PATH + encodeURIComponent(targetUrl);
+      const response = await fetch(url, options);
+      const text = await response.text();
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      }
+      return text;
+    }
+
+    async function joinRoom(roomId) {
+      const joinUrl = `${APPRTC_BASE}/join/${encodeURIComponent(roomId)}`;
+      const text = await proxyFetch(joinUrl, { method: 'POST', body: '' });
+      const json = JSON.parse(text);
+      if (json.result !== 'SUCCESS') {
+        throw new Error(`join failed: ${text}`);
+      }
+      joinInfo = json.params;
+      log('join result', {
+        client_id: joinInfo.client_id,
+        room_id: joinInfo.room_id,
+        is_initiator: joinInfo.is_initiator,
+        messages: Array.isArray(joinInfo.messages) ? joinInfo.messages.length : 0,
+      });
+      return joinInfo;
+    }
+
+    async function getIceServers(iceServerUrl) {
+      const text = await proxyFetch(iceServerUrl, { method: 'POST', body: '' });
+      const json = JSON.parse(text);
+      const iceServers = Array.isArray(json.iceServers) ? json.iceServers : [];
+      log('iceServers', iceServers);
+      return iceServers;
+    }
+
+    function parseSignalEnvelope(raw) {
+      const outer = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (outer && typeof outer.msg === 'string') {
+        return JSON.parse(outer.msg);
+      }
+      return outer;
+    }
+
+    async function ensureLocalAudio() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        localAudio.srcObject = localStream;
+        localAudio.muted = true;
+        localAudio.volume = 0;
+        setState();
+        log('local media ok', { tracks: localStream.getTracks().map(t => `${t.kind}:${t.readyState}`) });
+      } catch (error) {
+        log('local media unavailable, fallback recvonly', String(error));
+      }
+    }
+
+    function installPeerHandlers() {
+      pc.ontrack = async (event) => {
+        const [stream] = event.streams;
+        remoteStream = stream || new MediaStream([event.track]);
+        remoteAudio.srcObject = remoteStream;
+        log('ontrack', {
+          kind: event.track.kind,
+          id: event.track.id,
+          streams: event.streams.map(s => s.id),
+        });
+        event.track.onmute = () => log('remote track mute');
+        event.track.onunmute = () => log('remote track unmute');
+        event.track.onended = () => log('remote track ended');
+        await attachRemoteAudioGraph(remoteStream);
+        await forceAudioPlay('ontrack');
+        setState();
+      };
+
+      pc.onicecandidate = async (event) => {
+        if (!event.candidate) {
+          log('icecandidate end');
+          return;
+        }
+        log('local candidate', event.candidate.candidate);
+        await sendSignal({
+          type: 'candidate',
+          candidate: event.candidate.candidate,
+          label: event.candidate.sdpMLineIndex,
+          id: event.candidate.sdpMid,
+        });
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        log('ice state', pc.iceConnectionState);
+        setState();
+      };
+
+      pc.onconnectionstatechange = () => {
+        log('pc connection state', pc.connectionState);
+        setState();
+      };
+
+      pc.onsignalingstatechange = () => {
+        log('signaling state', pc.signalingState);
+      };
+    }
+
+    async function createPeer() {
+      const iceServers = await getIceServers(joinInfo.ice_server_url);
+      pc = new RTCPeerConnection({
+        iceServers,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require',
+      });
+      installPeerHandlers();
+
+      if (localStream) {
+        for (const track of localStream.getTracks()) {
+          pc.addTrack(track, localStream);
+        }
+      } else {
+        pc.addTransceiver('audio', { direction: 'recvonly' });
+      }
+      log('pc created');
+    }
+
+    async function sendSignal(message) {
+      if (!joinInfo) {
+        return;
+      }
+      const messageUrl = `${APPRTC_BASE}/message/${joinInfo.room_id}/${joinInfo.client_id}`;
+      await proxyFetch(messageUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+        body: JSON.stringify(message),
+      });
+      log('send', message.type || 'message');
+    }
+
+    async function applyQueuedCandidates() {
+      for (const candidate of queuedRemoteCandidates) {
+        await pc.addIceCandidate(candidate);
+        log('apply queued candidate', candidate.candidate);
+      }
+      queuedRemoteCandidates = [];
+    }
+
+    async function handleSignalMessage(raw) {
+      const message = parseSignalEnvelope(raw);
+      log('recv', message.type || 'unknown');
+
+      if (message.type === 'offer') {
+        await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+        await applyQueuedCandidates();
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await sendSignal({ type: 'answer', sdp: answer.sdp });
+        return;
+      }
+
+      if (message.type === 'candidate' && message.candidate) {
+        const candidate = new RTCIceCandidate({
+          candidate: message.candidate,
+          sdpMLineIndex: message.label ?? 0,
+          sdpMid: message.id ?? 'audio',
+        });
+        if (pc.remoteDescription) {
+          await pc.addIceCandidate(candidate);
+          log('add remote candidate', candidate.candidate);
+        } else {
+          queuedRemoteCandidates.push(candidate);
+          log('queue remote candidate', candidate.candidate);
+        }
+        return;
+      }
+
+      if (message.type === 'bye') {
+        log('recv bye');
+        await leave();
+      }
+    }
+
+    async function forceAudioPlay(source) {
+      try {
+        remoteAudio.autoplay = true;
+        remoteAudio.playsInline = true;
+        remoteAudio.muted = false;
+        remoteAudio.volume = 1;
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state !== 'running') {
+          await audioContext.resume();
+        }
+        await remoteAudio.play();
+        log(`audio.play ok from ${source}`);
+      } catch (error) {
+        log(`audio.play failed from ${source}`, String(error));
+      }
+      setState();
+    }
+
+    async function updateStats() {
+      if (!pc) {
+        statsEl.textContent = 'no peer connection';
+        return;
+      }
+      const report = await pc.getStats();
+      const rows = [];
+      rows.push(`pc.connectionState=${pc.connectionState}`);
+      rows.push(`pc.iceConnectionState=${pc.iceConnectionState}`);
+      rows.push(`remote.paused=${remoteAudio.paused}`);
+      rows.push(`remote.readyState=${remoteAudio.readyState}`);
+      rows.push(`remote.currentTime=${remoteAudio.currentTime.toFixed(3)}`);
+
+      for (const stat of report.values()) {
+        if (stat.type === 'inbound-rtp' && stat.kind === 'audio') {
+          rows.push(`inbound-audio packetsReceived=${stat.packetsReceived ?? 0} bytesReceived=${stat.bytesReceived ?? 0} jitter=${stat.jitter ?? 0}`);
+        }
+        if (stat.type === 'outbound-rtp' && stat.kind === 'audio') {
+          rows.push(`outbound-audio packetsSent=${stat.packetsSent ?? 0} bytesSent=${stat.bytesSent ?? 0}`);
+        }
+        if (stat.type === 'track' && stat.kind === 'audio') {
+          rows.push(`track-audio audioLevel=${stat.audioLevel ?? 'n/a'} totalAudioEnergy=${stat.totalAudioEnergy ?? 'n/a'} totalSamplesDuration=${stat.totalSamplesDuration ?? 'n/a'}`);
+        }
+        if (stat.type === 'candidate-pair' && stat.state === 'succeeded' && stat.nominated) {
+          rows.push(`candidate-pair currentRoundTripTime=${stat.currentRoundTripTime ?? 'n/a'} availableIncomingBitrate=${stat.availableIncomingBitrate ?? 'n/a'}`);
+        }
+      }
+      statsEl.textContent = rows.join('\n');
+      setState();
+    }
+
+    async function leave() {
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = null;
+      }
+      stopRemoteAudioGraph();
+      if (pc) {
+        try { pc.close(); } catch (_) {}
+        pc = null;
+      }
+      if (localStream) {
+        for (const track of localStream.getTracks()) {
+          track.stop();
+        }
+        localStream = null;
+      }
+      if (joinInfo) {
+        try {
+          const leaveUrl = `${APPRTC_BASE}/leave/${joinInfo.room_id}/${joinInfo.client_id}`;
+          await proxyFetch(leaveUrl, { method: 'POST', body: '' });
+          log('leave sent');
+        } catch (error) {
+          log('leave failed', String(error));
+        }
+      }
+      remoteAudio.srcObject = null;
+      localAudio.srcObject = null;
+      remoteStream = null;
+      joinInfo = null;
+      queuedRemoteCandidates = [];
+      setState();
+    }
+
+    async function start() {
+      try {
+        await leave();
+        const roomId = roomInput.value.trim();
+        if (!roomId) {
+          throw new Error('room id required');
+        }
+        await joinRoom(roomId);
+        await ensureLocalAudio();
+        await createPeer();
+
+        const messages = Array.isArray(joinInfo.messages) ? joinInfo.messages : [];
+        if (!messages.length) {
+          log('no initial signaling messages; start device first so browser joins as answerer');
+        }
+        for (const item of messages) {
+          await handleSignalMessage(item);
+        }
+
+        await forceAudioPlay('join-click');
+        await updateStats();
+        statsTimer = setInterval(() => updateStats().catch(error => log('stats failed', String(error))), 2000);
+      } catch (error) {
+        log('start failed', String(error));
+        console.error(error);
+      }
+    }
+
+    joinBtn.addEventListener('click', () => start());
+    leaveBtn.addEventListener('click', () => leave());
+    forcePlayBtn.addEventListener('click', () => forceAudioPlay('force-button'));
+    statsBtn.addEventListener('click', () => updateStats().catch(error => log('stats failed', String(error))));
+
+    remoteAudio.addEventListener('play', () => { log('remote audio play event'); setState(); });
+    remoteAudio.addEventListener('pause', () => { log('remote audio pause event'); setState(); });
+    remoteAudio.addEventListener('error', () => { log('remote audio error', remoteAudio.error?.message || remoteAudio.error?.code || 'unknown'); setState(); });
+
+    setState();
+  </script>
+</body>
+</html>

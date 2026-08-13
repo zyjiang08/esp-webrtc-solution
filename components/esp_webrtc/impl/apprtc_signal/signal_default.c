@@ -271,11 +271,18 @@ static int on_text(void *user, const char *text, size_t len)
     if (len == 0) {
         return 0;
     }
-    // printf("on_text(user, ws, '%.*s', %zd)\n", (int) len, text, len);
     wss_sig_t *sg = user;
+    char *payload = malloc(len + 1);
+    if (payload == NULL) {
+        return -1;
+    }
+    memcpy(payload, text, len);
+    payload[len] = 0;
     if (sg->cfg.on_msg) {
-        cJSON *_json = cJSON_Parse(text);
+        cJSON *_json = cJSON_Parse(payload);
         cJSON *msg = NULL;
+        cJSON *parsed_msg = NULL;
+        bool handled = false;
         do {
             if (_json == NULL) {
                 break;
@@ -290,7 +297,15 @@ static int on_text(void *user, const char *text, size_t len)
                 }
                 msg = _json;
             } else {
-                msg = cJSON_Parse(msg->valuestring);
+                if (cJSON_IsString(msg) && msg->valuestring) {
+                    parsed_msg = cJSON_Parse(msg->valuestring);
+                    msg = parsed_msg;
+                } else if (!cJSON_IsObject(msg)) {
+                    break;
+                }
+                if (msg == NULL) {
+                    break;
+                }
                 method = cJSON_GetObjectItem(msg, "type");
                 if (method == NULL) {
                     break;
@@ -299,25 +314,30 @@ static int on_text(void *user, const char *text, size_t len)
             if (strcmp(method->valuestring, "offer") == 0) {
                 cJSON *sdp = cJSON_GetObjectItem(msg, "sdp");
                 if (sdp) {
+                    ESP_LOGI(TAG, "Recv signaling type=offer sdp_len=%d", (int)strlen(sdp->valuestring));
                     esp_peer_signaling_msg_t msg = {
                         .type = ESP_PEER_SIGNALING_MSG_SDP,
                         .data = (uint8_t *)sdp->valuestring,
                         .size = strlen(sdp->valuestring),
                     };
                     sg->cfg.on_msg(&msg, sg->cfg.ctx);
+                    handled = true;
                 }
             } else if (strcmp(method->valuestring, "answer") == 0) {
                 cJSON *sdp = cJSON_GetObjectItem(msg, "sdp");
                 if (sdp) {
+                    ESP_LOGI(TAG, "Recv signaling type=answer sdp_len=%d", (int)strlen(sdp->valuestring));
                     esp_peer_signaling_msg_t msg = {
                         .type = ESP_PEER_SIGNALING_MSG_SDP,
                         .data = (uint8_t *)sdp->valuestring,
                         .size = strlen(sdp->valuestring),
                     };
                     sg->cfg.on_msg(&msg, sg->cfg.ctx);
+                    handled = true;
                 }
             } else if (strcmp(method->valuestring, "bye") == 0) {
                 // Peer closed
+                ESP_LOGI(TAG, "Recv signaling type=bye");
                 esp_peer_signaling_msg_t msg = {
                     .type = ESP_PEER_SIGNALING_MSG_BYE,
                 };
@@ -325,6 +345,7 @@ static int on_text(void *user, const char *text, size_t len)
                 // When peer leave change rule to caller directly
                 ESP_LOGI(TAG, "Peer leaved become controlling now");
                 sg->ice_info.is_initiator = true;
+                handled = true;
             } else if (strcmp(method->valuestring, "candidate") == 0) {
                 cJSON *candidate = cJSON_GetObjectItem(msg, "candidate");
                 if (candidate) {
@@ -334,26 +355,31 @@ static int on_text(void *user, const char *text, size_t len)
                         .size = strlen(candidate->valuestring),
                     };
                     sg->cfg.on_msg(&msg, sg->cfg.ctx);
+                    handled = true;
                 }
             } else if (strcmp(method->valuestring, "customized") == 0) {
                 cJSON *custom_data = cJSON_GetObjectItem(msg, "data");
                 if (custom_data) {
+                    ESP_LOGI(TAG, "Recv signaling type=customized len=%d", (int)strlen(custom_data->valuestring));
                     esp_peer_signaling_msg_t msg = {
                         .type = ESP_PEER_SIGNALING_MSG_CUSTOMIZED,
                         .data = (uint8_t *)custom_data->valuestring,
                         .size = strlen(custom_data->valuestring),
                     };
                     sg->cfg.on_msg(&msg, sg->cfg.ctx);
+                    handled = true;
                 }
             }
         } while (0);
-        if (msg == NULL) {
-            ESP_LOGE(TAG, "Bad json input");
-        } else if (msg != _json) {
-            cJSON_Delete(msg);
+        if (!handled) {
+            ESP_LOGE(TAG, "Bad json input len=%d", (int)len);
+        }
+        if (parsed_msg) {
+            cJSON_Delete(parsed_msg);
         }
         cJSON_Delete(_json);
     }
+    free(payload);
     return 0;
 }
 

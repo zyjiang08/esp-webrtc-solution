@@ -295,6 +295,24 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
+#### 4.1 重新编译与验证（推荐）
+
+如果你修改了组件源码、切换了分支，或者想确认当前 `esp-webrtc-solution` 可以从干净状态重新构建，建议执行下面两条命令：
+
+```bash
+# 干净重编译
+source ~/esp/esp-idf/export.sh && idf.py fullclean build
+
+# 输出镜像大小与分区占用，验证 bin 是否仍能放入 app 分区
+source ~/esp/esp-idf/export.sh && idf.py size
+```
+
+说明：
+
+- `idf.py fullclean build` 会先清理当前构建目录，再重新生成所有构建产物
+- `idf.py size` 会输出 Flash / DIRAM / RTC FAST 等占用情况
+- 对当前 `peer_demo` 而言，这两条命令特别适合用于验证源码版 `libpeer` 集成后是否仍能稳定通过构建
+
 **预期输出**:
 ```
 Project build complete. To flash, run:

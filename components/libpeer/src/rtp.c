@@ -286,15 +286,25 @@ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size
 void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data) {
   rtp_decoder->on_packet = on_packet;
   rtp_decoder->user_data = user_data;
+  rtp_decoder->type = 0;
 
   switch (codec) {
     case CODEC_H264:
+      rtp_decoder->type = PT_H264;
       rtp_decoder->decode_func = rtp_decode_h264;
       break;
     case CODEC_PCMA:
-    case CODEC_PCMU:
-    case CODEC_OPUS:
+      rtp_decoder->type = PT_PCMA;
       rtp_decoder->decode_func = rtp_decode_generic;
+      break;
+    case CODEC_PCMU:
+      rtp_decoder->type = PT_PCMU;
+      rtp_decoder->decode_func = rtp_decode_generic;
+      break;
+    case CODEC_OPUS:
+      rtp_decoder->type = PT_OPUS;
+      rtp_decoder->decode_func = rtp_decode_generic;
+      break;
     default:
       break;
   }
